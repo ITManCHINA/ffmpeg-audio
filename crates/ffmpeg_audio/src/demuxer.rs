@@ -251,6 +251,10 @@ impl Demuxer {
                 return None;
             }
 
+            // 安全防御性检查：校验 streams 数组指针及越界访问
+            if (*self.ctx).streams.is_null() || self.audio_stream_idx >= (*self.ctx).nb_streams as usize {
+                return None;
+            }
             let stream_ptr = *(*self.ctx).streams.add(self.audio_stream_idx);
             if stream_ptr.is_null() {
                 return None;
@@ -258,6 +262,9 @@ impl Demuxer {
             let time_base = (*stream_ptr).time_base;
             let mut last_pts = None;
             let mut last_duration = 0;
+
+            // 在开始读取前，先释放可能已经存在于 self.packet 中的数据，防止 FFI 内存泄漏
+            sys::av_packet_unref(self.packet);
 
             // 循环读取数据包并记录最后的 PTS 及 Duration
             while sys::av_read_frame(self.ctx, self.packet) >= 0 {
@@ -276,13 +283,7 @@ impl Demuxer {
             }
 
             // 重新 Seek 回文件开头并校验返回值，确保后续能正常播放
-            let seek_ret = sys::av_seek_frame(
-                self.ctx,
-                self.audio_stream_idx as i32,
-                0,
-                1,
-            );
-            if seek_ret < 0 {
+            if self.seek_to(Duration::ZERO).is_err() {
                 return None;
             }
 
