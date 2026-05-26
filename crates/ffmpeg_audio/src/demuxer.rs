@@ -238,7 +238,7 @@ impl Demuxer {
     }
 
     /// 针对 iff 解复用器：通过扫描数据包计算精准播放时长
-    pub fn scan_exact_duration(&mut self) -> Result<Option<Duration>> {
+    pub fn scan_exact_duration(&mut self) -> Result<Option<Option<Duration>>> {
         unsafe {
             // 校验 FFI 指针
             if self.ctx.is_null() || (*self.ctx).iformat.is_null() {
@@ -307,10 +307,10 @@ impl Demuxer {
                 };
                 let duration_us = sys::av_rescale_q(total_pts, time_base, bq);
                 if duration_us >= 0 {
-                    return Ok(Some(Duration::from_micros(duration_us.cast_unsigned())));
+                    return Ok(Some(Some(Duration::from_micros(duration_us.cast_unsigned()))));
                 }
             }
-            Ok(None)
+            Ok(Some(None))
         }
     }
 }

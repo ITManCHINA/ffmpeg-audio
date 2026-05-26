@@ -79,8 +79,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "⏱️ 扫描完毕！精准时长为: {} 时 {} 分 {} 秒.{:03}",
                 hours, minutes, seconds, millis
             );
+        } else if let Some(duration) = reader.duration() {
+            let total_secs = duration.as_secs();
+            let hours = total_secs / 3600;
+            let minutes = (total_secs % 3600) / 60;
+            let seconds = total_secs % 60;
+            let millis = duration.subsec_millis();
+            println!(
+                "⏱️ 时长为 (无需扫描): {} 时 {} 分 {} 秒.{:03}",
+                hours, minutes, seconds, millis
+            );
         } else {
-            println!("⚠️ 无法扫描获取该文件的精准时长");
+            println!("⚠️ 无法获取该文件的时长");
         }
     }
 
