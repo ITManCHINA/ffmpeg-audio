@@ -268,7 +268,7 @@ impl Demuxer {
 
             // 循环读取数据包并记录最后的 PTS 及 Duration
             while sys::av_read_frame(self.ctx, self.packet) >= 0 {
-                if (*self.packet).stream_index as usize == self.audio_stream_idx {
+                if (*self.packet).stream_index == self.audio_stream_idx as i32 {
                     if (*self.packet).pts != sys::AV_NOPTS_VALUE {
                         last_pts = Some((*self.packet).pts);
                         last_duration = if (*self.packet).duration > 0 && (*self.packet).duration != sys::AV_NOPTS_VALUE {

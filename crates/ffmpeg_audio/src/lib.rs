@@ -187,7 +187,13 @@ impl AudioReader {
     /// 针对 DFF (IFF) 格式，通过快速扫描底层数据包获取绝对精准的时长。
     /// 本操作会读取全文件包，耗时与文件大小成正比，建议在后台线程执行并缓存结果。
     pub fn scan_exact_duration(&mut self) -> Option<Duration> {
-        self.demuxer.scan_exact_duration()
+        let duration = self.demuxer.scan_exact_duration()?;
+        self.decoder.flush();
+        let _ = self.resampler.flush();
+        self.audio_buffer.clear();
+        self.is_exhausted = false;
+        self.current_pts = None;
+        Some(duration)
     }
 
     #[must_use]
