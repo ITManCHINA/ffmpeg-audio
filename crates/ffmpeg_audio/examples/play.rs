@@ -66,32 +66,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info.channels
     );
 
-    // 针对 IFF/DFF 容器进行全量数据包扫描获取精确时长
-    if info.codec_name.as_deref().is_some_and(|name| name.starts_with("dsd")) {
+    // 获取并打印时长
+    let duration_info = if info.codec_name.as_deref().is_some_and(|name| name.starts_with("dsd")) {
         println!("🔍 正在对 IFF/DFF 容器进行全量数据包扫描...");
-        if let Some(exact_duration) = reader.scan_exact_duration()? {
-            let total_secs = exact_duration.as_secs();
-            let hours = total_secs / 3600;
-            let minutes = (total_secs % 3600) / 60;
-            let seconds = total_secs % 60;
-            let millis = exact_duration.subsec_millis();
-            println!(
-                "⏱️ 扫描完毕！精准时长为: {} 时 {} 分 {} 秒.{:03}",
-                hours, minutes, seconds, millis
-            );
-        } else if let Some(duration) = reader.duration() {
-            let total_secs = duration.as_secs();
-            let hours = total_secs / 3600;
-            let minutes = (total_secs % 3600) / 60;
-            let seconds = total_secs % 60;
-            let millis = duration.subsec_millis();
-            println!(
-                "⏱️ 时长为 (无需扫描): {} 时 {} 分 {} 秒.{:03}",
-                hours, minutes, seconds, millis
-            );
-        } else {
-            println!("⚠️ 无法获取该文件的时长");
+        match reader.scan_exact_duration()? {
+            Some(d) => Some((d, "扫描完毕！精准时长为")),
+            None => reader.duration().map(|d| (d, "时长为 (无需扫描)")),
         }
+    } else {
+        reader.duration().map(|d| (d, "文件时长为"))
+    };
+
+    if let Some((d, label)) = duration_info {
+        let total_secs = d.as_secs();
+        let hours = total_secs / 3600;
+        let minutes = (total_secs % 3600) / 60;
+        let seconds = total_secs % 60;
+        let millis = d.subsec_millis();
+        println!(
+            "⏱️ {}: {} 时 {} 分 {} 秒.{:03}",
+            label, hours, minutes, seconds, millis
+        );
+    } else {
+        println!("⚠️ 无法获取该文件的时长");
     }
 
     let buffer_capacity = (sample_rate * u32::from(channels) * 4) as usize;

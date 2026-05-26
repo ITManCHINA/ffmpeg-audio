@@ -190,24 +190,18 @@ impl AudioReader {
     /// # 注意
     /// 本操作会重置播放进度至文件开头，并清空解码器与重采样器的内部缓冲区。
     pub fn scan_exact_duration(&mut self) -> Result<Option<Duration>> {
-        match self.demuxer.scan_exact_duration() {
-            Ok(Some(opt_duration)) => {
-                self.decoder.flush();
-                let _ = self.resampler.flush();
-                self.audio_buffer.clear();
-                self.is_exhausted = false;
-                self.current_pts = None;
-                Ok(opt_duration)
-            }
+        let res = self.demuxer.scan_exact_duration();
+        if !matches!(res, Ok(None)) {
+            self.decoder.flush();
+            let _ = self.resampler.flush();
+            self.audio_buffer.clear();
+            self.is_exhausted = false;
+            self.current_pts = None;
+        }
+        match res {
+            Ok(Some(opt_duration)) => Ok(opt_duration),
             Ok(None) => Ok(None),
-            Err(e) => {
-                self.decoder.flush();
-                let _ = self.resampler.flush();
-                self.audio_buffer.clear();
-                self.is_exhausted = false;
-                self.current_pts = None;
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
