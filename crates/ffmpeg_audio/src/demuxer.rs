@@ -289,7 +289,7 @@ impl Demuxer {
 
             // 将最后 PTS 加上最后一包持续时间转换为系统 Duration
             if let Some(pts) = last_pts {
-                let total_pts = pts + last_duration;
+                let total_pts = pts.saturating_add(last_duration);
                 let bq = sys::AVRational {
                     num: 1,
                     den: sys::AV_TIME_BASE.cast_signed(),
