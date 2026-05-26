@@ -236,6 +236,61 @@ impl Demuxer {
             None
         }
     }
+
+    /// 针对 iff 解复用器：通过扫描数据包计算精准播放时长
+    pub fn scan_exact_duration(&mut self) -> Option<Duration> {
+        unsafe {
+            // 校验 FFI 指针
+            if self.ctx.is_null() || (*self.ctx).iformat.is_null() {
+                return None;
+            }
+
+            // 仅对 iff (DFF) 格式执行扫描
+            let format_name = std::ffi::CStr::from_ptr((*(*self.ctx).iformat).name);
+            if format_name.to_bytes() != b"iff" {
+                return None;
+            }
+
+            let stream_ptr = *(*self.ctx).streams.add(self.audio_stream_idx);
+            if stream_ptr.is_null() {
+                return None;
+            }
+            let time_base = (*stream_ptr).time_base;
+            let mut last_pts = 0;
+
+            // 循环读取数据包并记录最后的 PTS
+            while sys::av_read_frame(self.ctx, self.packet) >= 0 {
+                if (*self.packet).stream_index as usize == self.audio_stream_idx {
+                    if (*self.packet).pts != sys::AV_NOPTS_VALUE {
+                        last_pts = (*self.packet).pts;
+                    }
+                }
+                // 释放数据包以防止内存泄漏
+                sys::av_packet_unref(self.packet);
+            }
+
+            // 重新 Seek 回文件开头以保证后续正常播放
+            sys::av_seek_frame(
+                self.ctx,
+                self.audio_stream_idx as i32,
+                0,
+                sys::AVSEEK_FLAG_BACKWARD.cast_signed(),
+            );
+
+            // 将最后 PTS 转换为系统 Duration
+            if last_pts > 0 {
+                let bq = sys::AVRational {
+                    num: 1,
+                    den: sys::AV_TIME_BASE.cast_signed(),
+                };
+                let duration_us = sys::av_rescale_q(last_pts, time_base, bq);
+                if duration_us >= 0 {
+                    return Some(Duration::from_micros(duration_us.cast_unsigned()));
+                }
+            }
+            None
+        }
+    }
 }
 
 unsafe fn extract_dict(dict: *mut sys::AVDictionary, map: &mut HashMap<String, String>) {
