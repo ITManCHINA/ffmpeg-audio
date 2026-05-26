@@ -70,7 +70,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if info.codec_name.as_deref().is_some_and(|name| name.starts_with("dsd")) {
         println!("🔍 正在对 IFF/DFF 容器进行全量数据包扫描...");
         if let Some(exact_duration) = reader.scan_exact_duration() {
-            println!("⏱️ 扫描完毕！精准时长为: {:.2} 秒", exact_duration.as_secs_f64());
+            let total_secs = exact_duration.as_secs();
+            let hours = total_secs / 3600;
+            let minutes = (total_secs % 3600) / 60;
+            let seconds = total_secs % 60;
+            let millis = exact_duration.subsec_millis();
+            println!(
+                "⏱️ 扫描完毕！精准时长为: {} 时 {} 分 {} 秒.{:03}",
+                hours, minutes, seconds, millis
+            );
         } else {
             println!("⚠️ 无法扫描获取该文件的精准时长");
         }
