@@ -274,7 +274,7 @@ impl Demuxer {
                 self.ctx,
                 self.audio_stream_idx as i32,
                 0,
-                sys::AVSEEK_FLAG_BACKWARD.cast_signed(),
+                1,
             );
 
             // 将最后 PTS 转换为系统 Duration

@@ -66,6 +66,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info.channels
     );
 
+    // 针对 IFF/DFF 容器进行全量数据包扫描获取精确时长
+    if info.codec_name.as_deref().is_some_and(|name| name.starts_with("dsd")) {
+        println!("🔍 正在对 IFF/DFF 容器进行全量数据包扫描...");
+        if let Some(exact_duration) = reader.scan_exact_duration() {
+            println!("⏱️ 扫描完毕！精准时长为: {:.2} 秒", exact_duration.as_secs_f64());
+        } else {
+            println!("⚠️ 无法扫描获取该文件的精准时长");
+        }
+    }
+
     let buffer_capacity = (sample_rate * u32::from(channels) * 4) as usize;
     let rb = HeapRb::<f32>::new(buffer_capacity);
     let (mut producer, mut consumer) = rb.split();
