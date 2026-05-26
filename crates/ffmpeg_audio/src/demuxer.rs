@@ -256,34 +256,44 @@ impl Demuxer {
                 return None;
             }
             let time_base = (*stream_ptr).time_base;
-            let mut last_pts = 0;
+            let mut last_pts = None;
+            let mut last_duration = 0;
 
-            // 循环读取数据包并记录最后的 PTS
+            // 循环读取数据包并记录最后的 PTS 及 Duration
             while sys::av_read_frame(self.ctx, self.packet) >= 0 {
                 if (*self.packet).stream_index as usize == self.audio_stream_idx {
                     if (*self.packet).pts != sys::AV_NOPTS_VALUE {
-                        last_pts = (*self.packet).pts;
+                        last_pts = Some((*self.packet).pts);
+                        last_duration = if (*self.packet).duration > 0 && (*self.packet).duration != sys::AV_NOPTS_VALUE {
+                            (*self.packet).duration
+                        } else {
+                            0
+                        };
                     }
                 }
                 // 释放数据包以防止内存泄漏
                 sys::av_packet_unref(self.packet);
             }
 
-            // 重新 Seek 回文件开头以保证后续正常播放
-            sys::av_seek_frame(
+            // 重新 Seek 回文件开头并校验返回值，确保后续能正常播放
+            let seek_ret = sys::av_seek_frame(
                 self.ctx,
                 self.audio_stream_idx as i32,
                 0,
                 1,
             );
+            if seek_ret < 0 {
+                return None;
+            }
 
-            // 将最后 PTS 转换为系统 Duration
-            if last_pts > 0 {
+            // 将最后 PTS 加上最后一包持续时间转换为系统 Duration
+            if let Some(pts) = last_pts {
+                let total_pts = pts + last_duration;
                 let bq = sys::AVRational {
                     num: 1,
                     den: sys::AV_TIME_BASE.cast_signed(),
                 };
-                let duration_us = sys::av_rescale_q(last_pts, time_base, bq);
+                let duration_us = sys::av_rescale_q(total_pts, time_base, bq);
                 if duration_us >= 0 {
                     return Some(Duration::from_micros(duration_us.cast_unsigned()));
                 }
