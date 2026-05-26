@@ -238,28 +238,31 @@ impl Demuxer {
     }
 
     /// 针对 iff 解复用器：通过扫描数据包计算精准播放时长
-    pub fn scan_exact_duration(&mut self) -> Option<Duration> {
+    pub fn scan_exact_duration(&mut self) -> Result<Option<Duration>> {
         unsafe {
             // 校验 FFI 指针
             if self.ctx.is_null() || (*self.ctx).iformat.is_null() {
-                return None;
+                return Ok(None);
             }
 
             // 仅对 iff (DFF) 格式执行扫描
             let format_name = std::ffi::CStr::from_ptr((*(*self.ctx).iformat).name);
             if format_name.to_bytes() != b"iff" {
-                return None;
+                return Ok(None);
             }
 
             // 安全防御性检查：校验 streams 数组指针及越界访问
             if (*self.ctx).streams.is_null() || self.audio_stream_idx >= (*self.ctx).nb_streams as usize {
-                return None;
+                return Ok(None);
             }
             let stream_ptr = *(*self.ctx).streams.add(self.audio_stream_idx);
             if stream_ptr.is_null() {
-                return None;
+                return Ok(None);
             }
             let time_base = (*stream_ptr).time_base;
+            if time_base.den == 0 {
+                return Ok(None);
+            }
             let mut last_pts = None;
             let mut last_duration = 0;
 
@@ -267,7 +270,17 @@ impl Demuxer {
             sys::av_packet_unref(self.packet);
 
             // 循环读取数据包并记录最后的 PTS 及 Duration
-            while sys::av_read_frame(self.ctx, self.packet) >= 0 {
+            loop {
+                let ret = sys::av_read_frame(self.ctx, self.packet);
+                if ret == sys::AVERROR_EOF {
+                    break;
+                }
+                if ret < 0 {
+                    // 即使读取失败，也尝试 seek 回开头以保持状态一致
+                    let _ = self.seek_to(Duration::ZERO);
+                    return Err(AudioError::from_ffmpeg(ret));
+                }
+
                 if (*self.packet).stream_index == self.audio_stream_idx as i32 {
                     if (*self.packet).pts != sys::AV_NOPTS_VALUE {
                         last_pts = Some((*self.packet).pts);
@@ -283,11 +296,9 @@ impl Demuxer {
             }
 
             // 重新 Seek 回文件开头并校验返回值，确保后续能正常播放
-            if self.seek_to(Duration::ZERO).is_err() {
-                return None;
-            }
+            self.seek_to(Duration::ZERO)?;
 
-            // 将最后 PTS 加上最后一包持续时间转换为系统 Duration
+            // 将最后 PTS 加上最后一包持续时间转换为系统 Duration，使用 saturating_add 防止溢出 panic
             if let Some(pts) = last_pts {
                 let total_pts = pts.saturating_add(last_duration);
                 let bq = sys::AVRational {
@@ -296,10 +307,10 @@ impl Demuxer {
                 };
                 let duration_us = sys::av_rescale_q(total_pts, time_base, bq);
                 if duration_us >= 0 {
-                    return Some(Duration::from_micros(duration_us.cast_unsigned()));
+                    return Ok(Some(Duration::from_micros(duration_us.cast_unsigned())));
                 }
             }
-            None
+            Ok(None)
         }
     }
 }

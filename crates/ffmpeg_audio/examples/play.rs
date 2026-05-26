@@ -69,7 +69,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 针对 IFF/DFF 容器进行全量数据包扫描获取精确时长
     if info.codec_name.as_deref().is_some_and(|name| name.starts_with("dsd")) {
         println!("🔍 正在对 IFF/DFF 容器进行全量数据包扫描...");
-        if let Some(exact_duration) = reader.scan_exact_duration() {
+        if let Some(exact_duration) = reader.scan_exact_duration()? {
             let total_secs = exact_duration.as_secs();
             let hours = total_secs / 3600;
             let minutes = (total_secs % 3600) / 60;
