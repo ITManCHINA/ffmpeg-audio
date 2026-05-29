@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let file_path = &args[1];
 
     let file = File::open(file_path)?;
-    let reader = AudioReader::new(file, 48000, 2)?;
+    let reader = AudioReader::new(file)?;
 
     let info = reader.source_info();
     println!(

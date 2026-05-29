@@ -3,7 +3,10 @@ use std::{
     time::Duration,
 };
 
-use ffmpeg_audio::AudioReader;
+use ffmpeg_audio::{
+    AudioReader,
+    ResampleOptions,
+};
 
 fn generate_sine_wav(duration_secs: f32) -> Vec<u8> {
     let sample_rate: u32 = 44100;
@@ -47,13 +50,25 @@ fn test_audio_pipeline_and_signal_validation() {
 
     let target_sample_rate = 48000;
     let target_channels = 2;
-    let mut reader = AudioReader::new(source, target_sample_rate, target_channels)
-        .expect("初始化 AudioReader 失败");
+
+    let reader = AudioReader::new(source).expect("初始化 AudioReader 失败");
+
+    let options = ResampleOptions::new()
+        .sample_rate(target_sample_rate)
+        .channels(target_channels)
+        .format::<f32>();
+
+    let mut resampled = reader
+        .into_resampled(options)
+        .expect("初始化 ResampledReader 失败");
 
     let mut total_samples = 0;
     let mut energy_sum: f64 = 0.0;
 
-    while let Some(frame) = reader.receive_frame().expect("解码过程中发生错误") {
+    while let Some(frame) = resampled
+        .receive_frame_as::<f32>()
+        .expect("解码过程中发生错误")
+    {
         assert_eq!(
             frame.len() % target_channels as usize,
             0,
@@ -83,7 +98,7 @@ fn test_audio_duration() {
     let wav_data = generate_sine_wav(2.0);
     let source = Cursor::new(wav_data);
 
-    let reader = AudioReader::new(source, 48000, 2).unwrap();
+    let reader = AudioReader::new(source).unwrap();
     let duration = reader.duration().expect("应能拿到 WAV 时长");
     let secs = duration.as_secs_f64();
     assert!((1.99..=2.01).contains(&secs), "时长应约为 2s，实际 {secs}");
@@ -94,16 +109,24 @@ fn test_audio_seek_functionality() {
     let wav_data = generate_sine_wav(2.0);
     let source = Cursor::new(wav_data);
 
-    let mut reader = AudioReader::new(source, 48000, 2).unwrap();
+    let reader = AudioReader::new(source).unwrap();
+    let mut resampled = reader
+        .into_resampled(
+            ResampleOptions::new()
+                .sample_rate(48000)
+                .channels(2)
+                .format::<f32>(),
+        )
+        .unwrap();
 
-    let _ = reader.receive_frame().unwrap();
-    let _ = reader.receive_frame().unwrap();
+    let _ = resampled.receive_frame_as::<f32>().unwrap();
+    let _ = resampled.receive_frame_as::<f32>().unwrap();
 
     let target = Duration::from_secs_f32(1.0);
-    reader.seek(target).expect("Seek 调用失败");
+    resampled.seek(target).expect("Seek 调用失败");
 
-    let frame_after_seek = reader
-        .receive_frame()
+    let frame_after_seek = resampled
+        .receive_frame_as::<f32>()
         .expect("Seek 后读取帧报错")
         .expect("Seek 后立刻遇到了非预期的 EOF");
 
@@ -113,7 +136,8 @@ fn test_audio_seek_functionality() {
 #[test]
 fn test_current_playback_time_initially_none() {
     let wav_data = generate_sine_wav(1.0);
-    let reader = AudioReader::new(Cursor::new(wav_data), 48000, 2).unwrap();
+    let reader = AudioReader::new(Cursor::new(wav_data)).unwrap();
+
     assert!(
         reader.current_playback_time().is_none(),
         "解码开始前，current_playback_time 应为 None"
@@ -123,17 +147,25 @@ fn test_current_playback_time_initially_none() {
 #[test]
 fn test_current_playback_time_advances() {
     let wav_data = generate_sine_wav(1.0);
-    let mut reader = AudioReader::new(Cursor::new(wav_data), 48000, 2).unwrap();
+    let reader = AudioReader::new(Cursor::new(wav_data)).unwrap();
+    let mut resampled = reader
+        .into_resampled(
+            ResampleOptions::new()
+                .sample_rate(48000)
+                .channels(2)
+                .format::<f32>(),
+        )
+        .unwrap();
 
-    reader.receive_frame().unwrap();
-    let first_pts = reader.current_playback_time();
+    resampled.receive_frame_as::<f32>().unwrap();
+    let first_pts = resampled.current_playback_time();
     assert!(
         first_pts.is_some(),
         "解码至少一帧后，current_playback_time 应为 Some"
     );
 
-    while reader.receive_frame().unwrap().is_some() {}
-    let last_pts = reader.current_playback_time();
+    while resampled.receive_frame_as::<f32>().unwrap().is_some() {}
+    let last_pts = resampled.current_playback_time();
     assert!(
         last_pts >= first_pts,
         "播放时间应随解码推进而增大，first={first_pts:?} last={last_pts:?}"
@@ -143,14 +175,22 @@ fn test_current_playback_time_advances() {
 #[test]
 fn test_current_playback_time_resets_after_seek() {
     let wav_data = generate_sine_wav(2.0);
-    let mut reader = AudioReader::new(Cursor::new(wav_data), 48000, 2).unwrap();
+    let reader = AudioReader::new(Cursor::new(wav_data)).unwrap();
+    let mut resampled = reader
+        .into_resampled(
+            ResampleOptions::new()
+                .sample_rate(48000)
+                .channels(2)
+                .format::<f32>(),
+        )
+        .unwrap();
 
-    reader.receive_frame().unwrap();
-    assert!(reader.current_playback_time().is_some());
+    resampled.receive_frame_as::<f32>().unwrap();
+    assert!(resampled.current_playback_time().is_some());
 
-    reader.seek(Duration::from_secs(0)).unwrap();
+    resampled.seek(Duration::from_secs(0)).unwrap();
     assert!(
-        reader.current_playback_time().is_none(),
+        resampled.current_playback_time().is_none(),
         "Seek 后 current_playback_time 应重置为 None"
     );
 }
@@ -158,6 +198,15 @@ fn test_current_playback_time_resets_after_seek() {
 #[test]
 fn test_full_decode_no_panic() {
     let wav_data = generate_sine_wav(1.0);
-    let mut reader = AudioReader::new(Cursor::new(wav_data), 48000, 2).unwrap();
-    while reader.receive_frame().unwrap().is_some() {}
+    let reader = AudioReader::new(Cursor::new(wav_data)).unwrap();
+    let mut resampled = reader
+        .into_resampled(
+            ResampleOptions::new()
+                .sample_rate(48000)
+                .channels(2)
+                .format::<f32>(),
+        )
+        .unwrap();
+
+    while resampled.receive_frame_as::<f32>().unwrap().is_some() {}
 }

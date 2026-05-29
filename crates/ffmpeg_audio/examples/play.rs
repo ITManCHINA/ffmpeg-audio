@@ -12,6 +12,7 @@ use cpal::traits::{
 };
 use ffmpeg_audio::{
     AudioReader,
+    ResampleOptions,
     log::init_ffmpeg_logging,
 };
 use ringbuf::{
@@ -56,7 +57,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🎵 声卡已就绪: {sample_rate} Hz, {channels} 声道");
 
     let file = File::open(file_path)?;
-    let mut reader = AudioReader::new(file, i32::try_from(sample_rate)?, i32::from(channels))?;
+    let mut reader = AudioReader::new(file)?;
+
+    let options = ResampleOptions::new()
+        .sample_rate(i32::try_from(sample_rate)?)
+        .channels(i32::from(channels))
+        .format::<f32>();
 
     let info = reader.source_info();
     println!(
@@ -67,7 +73,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 获取并打印时长
-    let duration_info = if info.codec_name.as_deref().is_some_and(|name| name.starts_with("dsd")) {
+    let duration_info = if info
+        .codec_name
+        .as_deref()
+        .is_some_and(|name| name.starts_with("dsd"))
+    {
         println!("🔍 正在对 IFF/DFF 容器进行全量数据包扫描...");
         match reader.scan_exact_duration()? {
             Some(d) => Some((d, "扫描完毕！精准时长为")),
@@ -90,6 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         println!("⚠️ 无法获取该文件的时长");
     }
+    let mut resampled = reader.into_resampled(options)?;
 
     let buffer_capacity = (sample_rate * u32::from(channels) * 4) as usize;
     let rb = HeapRb::<f32>::new(buffer_capacity);
@@ -112,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     stream.play()?;
     println!("▶️ 开始播放...");
 
-    while let Some(frame) = reader.receive_frame()? {
+    while let Some(frame) = resampled.receive_frame_as::<f32>()? {
         let mut written = 0;
 
         while written < frame.len() {

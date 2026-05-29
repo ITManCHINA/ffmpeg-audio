@@ -20,6 +20,12 @@ pub enum AudioError {
 
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Audio format mismatch: requested type does not match resampler output format")]
+    FormatMismatch,
+
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(String),
 }
 
 impl AudioError {

@@ -325,7 +325,7 @@ unsafe fn extract_dict(dict: *mut sys::AVDictionary, map: &mut HashMap<String, S
         entry = unsafe {
             sys::av_dict_get(
                 dict,
-                c"".as_ptr().cast::<i8>(),
+                c"".as_ptr(),
                 entry,
                 sys::AV_DICT_IGNORE_SUFFIX.cast_signed(),
             )
