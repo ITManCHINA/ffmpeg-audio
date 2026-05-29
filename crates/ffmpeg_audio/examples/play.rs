@@ -57,14 +57,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("🎵 声卡已就绪: {sample_rate} Hz, {channels} 声道");
 
     let file = File::open(file_path)?;
-    let mut reader = AudioReader::new(file)?;
+    let reader = AudioReader::new(file)?;
+
+    let quick_duration = reader.duration();
 
     let options = ResampleOptions::new()
         .sample_rate(i32::try_from(sample_rate)?)
         .channels(i32::from(channels))
         .format::<f32>();
 
-    let info = reader.source_info();
+    let mut resampled = reader.into_resampled(options)?;
+
+    let info = resampled.source_info();
     println!(
         "📄 源文件信息: {} ({} Hz, {} 声道)",
         info.codec_name.as_deref().unwrap_or("unknown"),
@@ -72,35 +76,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         info.channels
     );
 
-    // 获取并打印时长
-    let duration_info = if info
-        .codec_name
-        .as_deref()
-        .is_some_and(|name| name.starts_with("dsd"))
-    {
-        println!("🔍 正在对 IFF/DFF 容器进行全量数据包扫描...");
-        match reader.scan_exact_duration()? {
-            Some(d) => Some((d, "扫描完毕！精准时长为")),
-            None => reader.duration().map(|d| (d, "时长为 (无需扫描)")),
-        }
+    let duration_info = if let Some(dur) = quick_duration {
+        Some(dur)
+    } else if let Some(dur) = resampled.scan_exact_duration(true)? {
+        Some(dur)
     } else {
-        reader.duration().map(|d| (d, "文件时长为"))
+        resampled.scan_exact_duration(false)?
     };
 
-    if let Some((d, label)) = duration_info {
+    if let Some(d) = duration_info {
         let total_secs = d.as_secs();
-        let hours = total_secs / 3600;
-        let minutes = (total_secs % 3600) / 60;
+        let minutes = total_secs / 60;
         let seconds = total_secs % 60;
         let millis = d.subsec_millis();
-        println!(
-            "⏱️ {}: {} 时 {} 分 {} 秒.{:03}",
-            label, hours, minutes, seconds, millis
-        );
+        println!("⏱️ 音频时长: {minutes:02}:{seconds:02}.{millis:03}");
     } else {
         println!("⚠️ 无法获取该文件的时长");
     }
-    let mut resampled = reader.into_resampled(options)?;
 
     let buffer_capacity = (sample_rate * u32::from(channels) * 4) as usize;
     let rb = HeapRb::<f32>::new(buffer_capacity);
