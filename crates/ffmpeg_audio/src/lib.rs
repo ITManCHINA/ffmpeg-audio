@@ -294,7 +294,11 @@ impl AudioReader {
                     if pts != sys::AV_NOPTS_VALUE {
                         let duration = (*packet).duration;
 
-                        let end_pts = if duration > 0 { pts + duration } else { pts };
+                        let end_pts = if duration > 0 {
+                            pts.saturating_add(duration)
+                        } else {
+                            pts
+                        };
 
                         let bq = sys::AVRational {
                             num: 1,
@@ -327,7 +331,7 @@ impl AudioReader {
 
         if let Some(pts) = max_pts_us {
             // located a valid timestamp, and add the physical duration of the final frame
-            let total_us = pts + last_frame_duration_us;
+            let total_us = pts.saturating_add(last_frame_duration_us);
             Ok(Some(Duration::from_micros(total_us.max(0) as u64)))
         } else if !fast_mode && total_samples_fallback > 0 && self.source_info.sample_rate > 0 {
             // The entire file contains no PTS, yet we successfully decoded the sample waveform
