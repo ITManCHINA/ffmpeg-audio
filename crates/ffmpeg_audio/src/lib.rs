@@ -286,48 +286,70 @@ impl AudioReader {
         let mut max_pts_us: Option<i64> = None;
         let mut last_frame_duration_us: i64 = 0;
         let mut total_samples_fallback: usize = 0;
+        let mut scan_error = None;
 
         if fast_mode {
-            while let Some(packet) = self.demuxer.read_packet()? {
-                unsafe {
-                    let pts = (*packet).pts;
-                    if pts != sys::AV_NOPTS_VALUE {
-                        let duration = (*packet).duration;
+            loop {
+                match self.demuxer.read_packet() {
+                    Ok(Some(packet)) => unsafe {
+                        let pts = (*packet).pts;
+                        if pts != sys::AV_NOPTS_VALUE {
+                            let duration = (*packet).duration;
 
-                        let end_pts = if duration > 0 {
-                            pts.saturating_add(duration)
-                        } else {
-                            pts
-                        };
+                            let end_pts = if duration > 0 {
+                                pts.saturating_add(duration)
+                            } else {
+                                pts
+                            };
 
-                        let bq = sys::AVRational {
-                            num: 1,
-                            den: sys::AV_TIME_BASE.cast_signed(),
-                        };
-                        let end_us = sys::av_rescale_q(end_pts, self.time_base, bq);
-                        max_pts_us = Some(max_pts_us.unwrap_or(0).max(end_us));
+                            let bq = sys::AVRational {
+                                num: 1,
+                                den: sys::AV_TIME_BASE.cast_signed(),
+                            };
+                            let end_us = sys::av_rescale_q(end_pts, self.time_base, bq);
+
+                            max_pts_us = Some(max_pts_us.unwrap_or(0).max(end_us));
+                        }
+                    },
+                    Ok(None) => break,
+                    Err(e) => {
+                        scan_error = Some(e);
+                        break;
                     }
                 }
             }
         } else {
             let sample_rate = f64::from(self.source_info.sample_rate);
 
-            while let Some(frame) = self.receive_frame()? {
-                let samples = frame.samples();
-                total_samples_fallback += samples;
+            loop {
+                match self.receive_frame() {
+                    Ok(Some(frame)) => {
+                        let samples = frame.samples();
+                        total_samples_fallback += samples;
 
-                if let Some(pts) = frame.pts() {
-                    max_pts_us = Some(max_pts_us.unwrap_or(0).max(pts.as_micros() as i64));
-                }
+                        if let Some(pts) = frame.pts() {
+                            max_pts_us = Some(max_pts_us.unwrap_or(0).max(pts.as_micros() as i64));
+                        }
 
-                if sample_rate > 0.0 {
-                    let duration_secs = samples as f64 / sample_rate;
-                    last_frame_duration_us = (duration_secs * 1_000_000.0) as i64;
+                        if sample_rate > 0.0 {
+                            let duration_secs = samples as f64 / sample_rate;
+                            last_frame_duration_us = (duration_secs * 1_000_000.0) as i64;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        scan_error = Some(e);
+                        break;
+                    }
                 }
             }
         }
 
         self.seek(original_position)?;
+
+        if let Some(e) = scan_error {
+            return Err(e);
+        }
 
         if let Some(pts) = max_pts_us {
             // located a valid timestamp, and add the physical duration of the final frame
