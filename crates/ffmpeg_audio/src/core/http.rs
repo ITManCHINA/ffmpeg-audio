@@ -61,9 +61,15 @@ const USER_AGENT: &str = "Lavf/62.12.101";
 type AsyncReader = Pin<Box<dyn AsyncRead + Send + Sync + 'static>>;
 
 enum FetchAction {
-    Success(AsyncReader),
+    Success(AsyncReader, u64),
     Retry(Option<Duration>),
     Fatal(HttpError),
+}
+
+struct ContentRange {
+    start: u64,
+    end: u64,
+    total: u64,
 }
 
 /// An opaque, thread-safe handle used to trigger and reset cancellation of network operations on
@@ -133,6 +139,9 @@ pub struct HttpAudioSource {
     /// The currently active HTTP body reader.
     /// This is set to `None` upon a large-span seek or an unrecoverable network error.
     body_reader: Option<AsyncReader>,
+
+    /// The exclusive end offset of the currently active HTTP response range.
+    stream_end: u64,
 
     /// Opaque cancellation handle passed in from the upper-layer application
     cancel_handle: HttpCancelHandle,
@@ -206,7 +215,7 @@ impl HttpAudioSource {
             .map_err(|e| HttpError::Transport(e.to_string()))?;
 
         let active_token = handle.token();
-        let (content_length, body_reader) = rt.block_on(async {
+        let (content_length, stream_end, body_reader) = rt.block_on(async {
             tokio::select! {
                 res = Self::probe_stream(&client, url) => res,
 
@@ -222,6 +231,7 @@ impl HttpAudioSource {
             content_length,
             current_pos: 0,
             body_reader: Some(body_reader),
+            stream_end,
             cancel_handle: handle,
             active_token,
             rt,
@@ -240,7 +250,7 @@ impl HttpAudioSource {
         self.active_token.clone()
     }
 
-    async fn probe_stream(client: &Client, url: &str) -> Result<(u64, AsyncReader)> {
+    async fn probe_stream(client: &Client, url: &str) -> Result<(u64, u64, AsyncReader)> {
         let response = client
             .get(url)
             .header(header::USER_AGENT, USER_AGENT)
@@ -253,7 +263,23 @@ impl HttpAudioSource {
             return Err(HttpError::UnsupportedRange.into());
         }
 
-        let content_length = Self::parse_total_length(&response).ok_or(HttpError::UnknownLength)?;
+        let content_range = Self::parse_content_range(&response)
+            .ok_or_else(|| HttpError::InvalidContentRange("missing or malformed header".into()))?;
+        if content_range.start != 0 {
+            return Err(HttpError::InvalidContentRange(format!(
+                "range starts at {}, expected 0",
+                content_range.start
+            ))
+            .into());
+        }
+        if content_range.end >= content_range.total {
+            return Err(HttpError::InvalidContentRange(format!(
+                "range ends at {}, total length is {}",
+                content_range.end, content_range.total
+            ))
+            .into());
+        }
+        let content_length = content_range.total;
 
         #[cfg(feature = "tracing")]
         tracing::info!("Probing successful. Stream length: {content_length} bytes.");
@@ -261,30 +287,25 @@ impl HttpAudioSource {
         let stream = response.bytes_stream().map_err(io::Error::other);
         let reader: AsyncReader = Box::pin(StreamReader::new(stream));
 
-        Ok((content_length, reader))
+        Ok((content_length, content_range.end + 1, reader))
     }
 
-    fn parse_total_length(response: &reqwest::Response) -> Option<u64> {
-        if let Some(range_hdr) = response.headers().get(header::CONTENT_RANGE)
-            && let Ok(range_str) = range_hdr.to_str()
-            && let Some(slash_idx) = range_str.rfind('/')
-        {
-            let total_str = &range_str[slash_idx + 1..];
-            if total_str != "*"
-                && let Ok(total) = total_str.parse::<u64>()
-            {
-                return Some(total);
-            }
+    fn parse_content_range(response: &reqwest::Response) -> Option<ContentRange> {
+        let value = response
+            .headers()
+            .get(header::CONTENT_RANGE)?
+            .to_str()
+            .ok()?;
+        let (unit, range_and_total) = value.trim().split_once(' ')?;
+        if unit != "bytes" {
+            return None;
         }
-
-        if let Some(len_hdr) = response.headers().get(header::CONTENT_LENGTH)
-            && let Ok(len_str) = len_hdr.to_str()
-            && let Ok(total) = len_str.parse::<u64>()
-        {
-            return Some(total);
-        }
-
-        None
+        let (range, total) = range_and_total.split_once('/')?;
+        let (start, end) = range.split_once('-')?;
+        let start = start.parse().ok()?;
+        let end = end.parse().ok()?;
+        let total = total.parse().ok()?;
+        (start <= end).then_some(ContentRange { start, end, total })
     }
 
     async fn execute_seek_request(&self, target_pos: u64) -> FetchAction {
@@ -303,10 +324,28 @@ impl HttpAudioSource {
 
                 match status {
                     StatusCode::PARTIAL_CONTENT => {
+                        let Some(content_range) = Self::parse_content_range(&resp) else {
+                            return FetchAction::Fatal(HttpError::InvalidContentRange(
+                                "missing or malformed header".into(),
+                            ));
+                        };
+                        if content_range.start != target_pos {
+                            return FetchAction::Fatal(HttpError::InvalidContentRange(format!(
+                                "range starts at {}, expected {target_pos}",
+                                content_range.start
+                            )));
+                        }
+                        if content_range.total != self.content_length {
+                            return FetchAction::Fatal(HttpError::InvalidContentRange(format!(
+                                "total length is {}, expected {}",
+                                content_range.total, self.content_length
+                            )));
+                        }
+
                         let stream = resp.bytes_stream().map_err(io::Error::other);
                         let reader: AsyncReader = Box::pin(StreamReader::new(stream));
 
-                        FetchAction::Success(reader)
+                        FetchAction::Success(reader, content_range.end + 1)
                     }
                     _ if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() => {
                         let delay = resp
@@ -368,8 +407,9 @@ impl HttpAudioSource {
             }
 
             match self.execute_seek_request(target_pos).await {
-                FetchAction::Success(reader) => {
+                FetchAction::Success(reader, stream_end) => {
                     self.body_reader = Some(reader);
+                    self.stream_end = stream_end;
                     self.current_pos = target_pos;
                     return Ok(());
                 }
@@ -459,10 +499,12 @@ impl Read for HttpAudioSource {
             }
 
             let reader = self.body_reader.as_mut().unwrap();
+            let remaining = self.stream_end.saturating_sub(self.current_pos);
+            let read_buf_len = std::cmp::min(remaining, buf.len() as u64) as usize;
 
             let read_result = rt_handle.block_on(async {
                 tokio::select! {
-                    res = tokio::time::timeout(RECV_TIMEOUT, reader.read(buf)) => {
+                    res = tokio::time::timeout(RECV_TIMEOUT, reader.read(&mut buf[..read_buf_len])) => {
                         res.unwrap_or_else(|_| Err(Error::new(ErrorKind::TimedOut, "Stream read timeout")))
                     }
                     () = cancel_token.cancelled() => {
@@ -473,23 +515,15 @@ impl Read for HttpAudioSource {
 
             match read_result {
                 Ok(0) => {
+                    if self.current_pos < self.stream_end {
+                        return Err(Error::other(format!(
+                            "Stream ends prematurely at {}, should be {}",
+                            self.current_pos, self.stream_end
+                        )));
+                    }
+
                     if self.current_pos < self.content_length {
-                        if network_retried {
-                            return Err(Error::new(
-                                ErrorKind::UnexpectedEof,
-                                "Premature EOF: Server closed connection repeatedly",
-                            ));
-                        }
-
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(
-                            "Premature EOF at offset {} (expected {}). Connection dropped by server. Recovering.",
-                            self.current_pos,
-                            self.content_length
-                        );
-
                         self.body_reader = None;
-                        network_retried = true;
                     } else {
                         return Ok(0);
                     }
@@ -769,6 +803,7 @@ mod tests {
             content_length: 1024,
             current_pos: 0,
             body_reader: None,
+            stream_end: 0,
             cancel_handle: cancel_handle.clone(),
             active_token: cancel_handle.token(),
             rt: tokio::runtime::Builder::new_current_thread()

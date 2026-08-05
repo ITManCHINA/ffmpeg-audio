@@ -19,6 +19,9 @@ pub enum HttpError {
     #[error("Unknown stream length (no valid Content-Range or Content-Length found)")]
     UnknownLength,
 
+    #[error("Invalid Content-Range: {0}")]
+    InvalidContentRange(String),
+
     #[error("HTTP error status: {0}")]
     Status(u16),
 
