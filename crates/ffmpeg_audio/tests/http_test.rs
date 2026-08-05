@@ -21,7 +21,7 @@ fn http_test() {
         .try_init()
         .unwrap();
 
-    let url = "http://127.0.0.1:8080";
+    let url = "http://127.0.0.1:8000/seek_test.aac";
 
     println!("Connecting to {url}...");
     let source = HttpAudioSource::new(url).expect("Failed to initialize HTTP source");

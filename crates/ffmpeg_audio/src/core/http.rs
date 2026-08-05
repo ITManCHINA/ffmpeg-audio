@@ -56,6 +56,9 @@ const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 /// long wait times specified in the Retry-After header
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
+const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(120);
+const MAX_RECONNECT_TOTAL_DELAY: Duration = Duration::from_secs(256);
+
 const USER_AGENT: &str = "Lavf/62.12.101";
 
 type AsyncReader = Pin<Box<dyn AsyncRead + Send + Sync + 'static>>;
@@ -66,10 +69,20 @@ enum FetchAction {
     Fatal(HttpError),
 }
 
+#[derive(Clone, Copy)]
 struct ContentRange {
     start: u64,
     end: u64,
     total: u64,
+}
+
+fn next_reconnect_delay(current: Duration) -> io::Result<Duration> {
+    let seconds = current
+        .as_secs()
+        .checked_mul(2)
+        .and_then(|seconds| seconds.checked_add(1))
+        .ok_or_else(|| Error::other("Reconnect delay overflow"))?;
+    Ok(Duration::from_secs(seconds))
 }
 
 /// An opaque, thread-safe handle used to trigger and reset cancellation of network operations on
@@ -142,6 +155,10 @@ pub struct HttpAudioSource {
 
     /// The exclusive end offset of the currently active HTTP response range.
     stream_end: u64,
+
+    /// Backoff state for consecutive reconnects without a successful read.
+    reconnect_delay: Duration,
+    reconnect_total_delay: Duration,
 
     /// Opaque cancellation handle passed in from the upper-layer application
     cancel_handle: HttpCancelHandle,
@@ -232,6 +249,8 @@ impl HttpAudioSource {
             current_pos: 0,
             body_reader: Some(body_reader),
             stream_end,
+            reconnect_delay: Duration::ZERO,
+            reconnect_total_delay: Duration::ZERO,
             cancel_handle: handle,
             active_token,
             rt,
@@ -260,25 +279,14 @@ impl HttpAudioSource {
             .map_err(|e| HttpError::Transport(e.to_string()))?;
 
         if response.status() != StatusCode::PARTIAL_CONTENT {
-            return Err(HttpError::UnsupportedRange.into());
+            return Err(if response.status() == StatusCode::OK {
+                HttpError::UnsupportedRange.into()
+            } else {
+                HttpError::Status(response.status().as_u16()).into()
+            });
         }
 
-        let content_range = Self::parse_content_range(&response)
-            .ok_or_else(|| HttpError::InvalidContentRange("missing or malformed header".into()))?;
-        if content_range.start != 0 {
-            return Err(HttpError::InvalidContentRange(format!(
-                "range starts at {}, expected 0",
-                content_range.start
-            ))
-            .into());
-        }
-        if content_range.end >= content_range.total {
-            return Err(HttpError::InvalidContentRange(format!(
-                "range ends at {}, total length is {}",
-                content_range.end, content_range.total
-            ))
-            .into());
-        }
+        let content_range = Self::parse_and_validate_content_range(&response, 0, None)?;
         let content_length = content_range.total;
 
         #[cfg(feature = "tracing")]
@@ -290,12 +298,7 @@ impl HttpAudioSource {
         Ok((content_length, content_range.end + 1, reader))
     }
 
-    fn parse_content_range(response: &reqwest::Response) -> Option<ContentRange> {
-        let value = response
-            .headers()
-            .get(header::CONTENT_RANGE)?
-            .to_str()
-            .ok()?;
+    fn parse_content_range(value: &str) -> Option<ContentRange> {
         let (unit, range_and_total) = value.trim().split_once(' ')?;
         if unit != "bytes" {
             return None;
@@ -306,6 +309,50 @@ impl HttpAudioSource {
         let end = end.parse().ok()?;
         let total = total.parse().ok()?;
         (start <= end).then_some(ContentRange { start, end, total })
+    }
+
+    fn validate_content_range(
+        range: ContentRange,
+        expected_start: u64,
+        expected_total: Option<u64>,
+    ) -> std::result::Result<ContentRange, HttpError> {
+        if range.start != expected_start {
+            return Err(HttpError::InvalidContentRange(format!(
+                "range starts at {}, expected {expected_start}",
+                range.start
+            )));
+        }
+        if range.end >= range.total {
+            return Err(HttpError::InvalidContentRange(format!(
+                "range ends at {}, total length is {}",
+                range.end, range.total
+            )));
+        }
+        if let Some(expected_total) = expected_total
+            && range.total != expected_total
+        {
+            return Err(HttpError::InvalidContentRange(format!(
+                "total length is {}, expected {expected_total}",
+                range.total
+            )));
+        }
+        Ok(range)
+    }
+
+    fn parse_and_validate_content_range(
+        response: &reqwest::Response,
+        expected_start: u64,
+        expected_total: Option<u64>,
+    ) -> std::result::Result<ContentRange, HttpError> {
+        let value = response
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .ok_or_else(|| HttpError::InvalidContentRange("missing Content-Range header".into()))?
+            .to_str()
+            .map_err(|_| HttpError::InvalidContentRange("invalid header encoding".into()))?;
+        let range = Self::parse_content_range(value)
+            .ok_or_else(|| HttpError::InvalidContentRange("missing or malformed header".into()))?;
+        Self::validate_content_range(range, expected_start, expected_total)
     }
 
     async fn execute_seek_request(&self, target_pos: u64) -> FetchAction {
@@ -324,23 +371,14 @@ impl HttpAudioSource {
 
                 match status {
                     StatusCode::PARTIAL_CONTENT => {
-                        let Some(content_range) = Self::parse_content_range(&resp) else {
-                            return FetchAction::Fatal(HttpError::InvalidContentRange(
-                                "missing or malformed header".into(),
-                            ));
+                        let content_range = match Self::parse_and_validate_content_range(
+                            &resp,
+                            target_pos,
+                            Some(self.content_length),
+                        ) {
+                            Ok(range) => range,
+                            Err(error) => return FetchAction::Fatal(error),
                         };
-                        if content_range.start != target_pos {
-                            return FetchAction::Fatal(HttpError::InvalidContentRange(format!(
-                                "range starts at {}, expected {target_pos}",
-                                content_range.start
-                            )));
-                        }
-                        if content_range.total != self.content_length {
-                            return FetchAction::Fatal(HttpError::InvalidContentRange(format!(
-                                "total length is {}, expected {}",
-                                content_range.total, self.content_length
-                            )));
-                        }
 
                         let stream = resp.bytes_stream().map_err(io::Error::other);
                         let reader: AsyncReader = Box::pin(StreamReader::new(stream));
@@ -390,6 +428,78 @@ impl HttpAudioSource {
         }
     }
 
+    async fn execute_reconnect_request(&self, target_pos: u64) -> Result<(AsyncReader, u64)> {
+        let range_header = format!("bytes={target_pos}-");
+        let response = self
+            .client
+            .get(&self.url)
+            .header(header::USER_AGENT, USER_AGENT)
+            .header(header::RANGE, range_header)
+            .send()
+            .await
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
+
+        if response.status() != StatusCode::PARTIAL_CONTENT {
+            return Err(if response.status() == StatusCode::OK {
+                HttpError::UnsupportedRange.into()
+            } else {
+                HttpError::Status(response.status().as_u16()).into()
+            });
+        }
+
+        let content_range = Self::parse_and_validate_content_range(
+            &response,
+            target_pos,
+            Some(self.content_length),
+        )?;
+
+        let stream = response.bytes_stream().map_err(io::Error::other);
+        let reader: AsyncReader = Box::pin(StreamReader::new(stream));
+
+        Ok((reader, content_range.end + 1))
+    }
+
+    async fn wait_for_reconnect(&mut self) -> io::Result<()> {
+        let next_delay = next_reconnect_delay(self.reconnect_delay)?;
+
+        if next_delay > MAX_RECONNECT_DELAY
+            || self
+                .reconnect_total_delay
+                .checked_add(next_delay)
+                .is_none_or(|delay| delay > MAX_RECONNECT_TOTAL_DELAY)
+        {
+            return Err(Error::other("HTTP reconnect timeout"));
+        }
+
+        self.reconnect_delay = next_delay;
+        self.reconnect_total_delay += next_delay;
+
+        let target_pos = self.current_pos;
+        let cancel_token = self.cancel_token();
+        tokio::select! {
+            () = tokio::time::sleep(next_delay) => {},
+            () = cancel_token.cancelled() => {
+                return Err(Error::new(ErrorKind::Interrupted, "Cancelled"));
+            }
+        }
+
+        let (reader, stream_end) = tokio::select! {
+            result = tokio::time::timeout(
+                RECV_TIMEOUT,
+                self.execute_reconnect_request(target_pos),
+            ) => result
+                .map_err(|_| Error::new(ErrorKind::TimedOut, "Reconnect request timeout"))?
+                .map_err(io::Error::from)?,
+            () = cancel_token.cancelled() => {
+                return Err(Error::new(ErrorKind::Interrupted, "Cancelled"));
+            }
+        };
+
+        self.body_reader = Some(reader);
+        self.stream_end = stream_end;
+        Ok(())
+    }
+
     async fn hard_seek_with_retry(&mut self, target_pos: u64) -> Result<()> {
         self.body_reader = None;
 
@@ -411,6 +521,8 @@ impl HttpAudioSource {
                     self.body_reader = Some(reader);
                     self.stream_end = stream_end;
                     self.current_pos = target_pos;
+                    self.reconnect_delay = Duration::ZERO;
+                    self.reconnect_total_delay = Duration::ZERO;
                     return Ok(());
                 }
                 FetchAction::Fatal(err) => {
@@ -476,8 +588,6 @@ impl Read for HttpAudioSource {
             return Ok(0);
         }
 
-        let mut network_retried = false;
-
         loop {
             let cancel_token = self.cancel_token();
             let rt_handle = self.rt.handle().clone();
@@ -516,39 +626,41 @@ impl Read for HttpAudioSource {
             match read_result {
                 Ok(0) => {
                     if self.current_pos < self.stream_end {
-                        return Err(Error::other(format!(
-                            "Stream ends prematurely at {}, should be {}",
-                            self.current_pos, self.stream_end
-                        )));
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            "Premature EOF at offset {} (expected {}). Reconnecting...",
+                            self.current_pos,
+                            self.stream_end
+                        );
                     }
 
-                    if self.current_pos < self.content_length {
-                        self.body_reader = None;
-                    } else {
+                    if self.current_pos >= self.content_length {
                         return Ok(0);
                     }
+
+                    self.body_reader = None;
+                    rt_handle.block_on(self.wait_for_reconnect())?;
                 }
                 Ok(n) => {
                     self.current_pos += n as u64;
+                    self.reconnect_delay = Duration::ZERO;
+                    self.reconnect_total_delay = Duration::ZERO;
                     return Ok(n);
                 }
                 Err(e) if e.kind() == ErrorKind::Interrupted => {
                     return Err(e);
                 }
+                #[allow(unused_variables)]
                 Err(e) => {
-                    if network_retried {
-                        return Err(e);
-                    }
-
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
-                        "Network read error at offset {}: {}. Attempting to recover...",
+                        "Network read error at offset {}: {}. Reconnecting...",
                         self.current_pos,
                         e
                     );
 
                     self.body_reader = None;
-                    network_retried = true;
+                    rt_handle.block_on(self.wait_for_reconnect())?;
                 }
             }
         }
@@ -804,6 +916,8 @@ mod tests {
             current_pos: 0,
             body_reader: None,
             stream_end: 0,
+            reconnect_delay: Duration::ZERO,
+            reconnect_total_delay: Duration::ZERO,
             cancel_handle: cancel_handle.clone(),
             active_token: cancel_handle.token(),
             rt: tokio::runtime::Builder::new_current_thread()
@@ -836,6 +950,48 @@ mod tests {
         assert!(
             !cancel_handle.is_cancelled(),
             "Reset token should restore uncancelled state"
+        );
+    }
+
+    #[test]
+    fn test_content_range_validation() {
+        let valid = ContentRange {
+            start: 100,
+            end: 199,
+            total: 1_000,
+        };
+        assert!(HttpAudioSource::validate_content_range(valid, 100, Some(1_000)).is_ok());
+
+        let wrong_start = ContentRange { start: 99, ..valid };
+        assert!(HttpAudioSource::validate_content_range(wrong_start, 100, Some(1_000)).is_err());
+
+        let wrong_total = ContentRange {
+            total: 2_000,
+            ..valid
+        };
+        assert!(HttpAudioSource::validate_content_range(wrong_total, 100, Some(1_000)).is_err());
+
+        let invalid_end = ContentRange {
+            end: 1_000,
+            ..valid
+        };
+        assert!(HttpAudioSource::validate_content_range(invalid_end, 100, Some(1_000)).is_err());
+    }
+
+    #[test]
+    fn test_reconnect_backoff_and_limits() {
+        let mut delay = Duration::ZERO;
+        let expected = [1, 3, 7, 15, 31, 63, 127];
+
+        for seconds in expected {
+            delay = next_reconnect_delay(delay).unwrap();
+            assert_eq!(delay, Duration::from_secs(seconds));
+        }
+
+        assert!(delay > MAX_RECONNECT_DELAY);
+        assert!(Duration::from_secs(1 + 3 + 7 + 15 + 31 + 63 + 127) < MAX_RECONNECT_TOTAL_DELAY);
+        assert!(
+            Duration::from_secs(1 + 3 + 7 + 15 + 31 + 63 + 127 + 255) > MAX_RECONNECT_TOTAL_DELAY
         );
     }
 }

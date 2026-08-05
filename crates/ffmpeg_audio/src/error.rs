@@ -16,9 +16,6 @@ pub enum HttpError {
     #[error("Server does not support Range requests")]
     UnsupportedRange,
 
-    #[error("Unknown stream length (no valid Content-Range or Content-Length found)")]
-    UnknownLength,
-
     #[error("Invalid Content-Range: {0}")]
     InvalidContentRange(String),
 
