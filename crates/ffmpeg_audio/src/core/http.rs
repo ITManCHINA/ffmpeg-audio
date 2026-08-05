@@ -8,6 +8,10 @@ use std::{
         SeekFrom,
     },
     pin::Pin,
+    sync::{
+        Arc,
+        Mutex,
+    },
     time::Duration,
 };
 
@@ -62,6 +66,54 @@ enum FetchAction {
     Fatal(HttpError),
 }
 
+/// An opaque, thread-safe handle used to trigger and reset cancellation of network operations on
+/// [`HttpAudioSource`].
+#[derive(Clone, Default)]
+pub struct HttpCancelHandle {
+    inner: Arc<Mutex<CancellationToken>>,
+}
+
+impl HttpCancelHandle {
+    /// Creates a new [`HttpCancelHandle`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(CancellationToken::new())),
+        }
+    }
+
+    /// Triggers immediate cancellation of ongoing network operations associated with this handle.
+    pub fn cancel(&self) {
+        self.inner.lock().unwrap().cancel();
+    }
+
+    /// Resets the cancellation state, allowing subsequent operations to proceed normally.
+    ///
+    /// This is typically called prior to a seek operation on a reused audio source.
+    pub fn reset(&self) {
+        let mut token = self.inner.lock().unwrap();
+        if token.is_cancelled() {
+            *token = CancellationToken::new();
+        }
+    }
+
+    /// Returns `true` if the cancellation signal has been triggered and not yet reset.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.lock().unwrap().is_cancelled()
+    }
+
+    fn token(&self) -> CancellationToken {
+        self.inner.lock().unwrap().clone()
+    }
+}
+
+impl From<&Self> for HttpCancelHandle {
+    fn from(handle: &Self) -> Self {
+        handle.clone()
+    }
+}
+
 /// An HTTP audio source that supports remote range requests and is compatible with `std::io::Read +
 /// Seek`.
 pub struct HttpAudioSource {
@@ -82,8 +134,12 @@ pub struct HttpAudioSource {
     /// This is set to `None` upon a large-span seek or an unrecoverable network error.
     body_reader: Option<AsyncReader>,
 
-    /// Cancellation token passed in from the upper-layer application
-    cancel_token: CancellationToken,
+    /// Opaque cancellation handle passed in from the upper-layer application
+    cancel_handle: HttpCancelHandle,
+
+    /// Locally cached active token to eliminate Mutex lock overhead during high-frequency `read()`
+    /// calls.
+    active_token: CancellationToken,
 
     /// An isolated single-threaded Tokio runtime dedicated to driving current asynchronous network
     /// operations.
@@ -96,8 +152,8 @@ impl HttpAudioSource {
     /// Connection is permitted only if the server explicitly supports HTTP Range requests
     /// and provides a determinate content length.
     ///
-    /// This is a convenience constructor that delegates to [`Self::new_with_token`] with a newly
-    /// created, non-canceled [`CancellationToken`].
+    /// This is a convenience constructor that delegates to [`Self::new_with_cancel_handle`] with a
+    /// newly created, non-canceled [`HttpCancelHandle`].
     ///
     /// # Arguments
     ///
@@ -110,7 +166,7 @@ impl HttpAudioSource {
     /// * The total stream length cannot be determined from the headers.
     /// * A transport or connection error occurs during the initial network probe.
     pub fn new(url: &str) -> Result<Self> {
-        Self::new_with_token(url, CancellationToken::new())
+        Self::new_with_cancel_handle(url, HttpCancelHandle::new())
     }
 
     /// Attempts to connect to and probe the target remote URL, allowing the initial connection
@@ -120,25 +176,24 @@ impl HttpAudioSource {
     /// and provides a determinate content length.
     ///
     /// The initial HTTP probe request runs inside an internally managed, single-threaded Tokio
-    /// runtime. By passing a [`CancellationToken`], the caller can immediately abort this
+    /// runtime. By passing an opaque [`HttpCancelHandle`], the caller can immediately abort this
     /// synchronous initialization block if the remote server hangs or is unresponsive during
     /// TCP connection, TLS handshake, or while waiting for response headers.
     ///
     /// # Arguments
     ///
     /// * `url` - The URL of the target remote audio stream.
-    /// * `cancel_token` - A token used to interrupt the initialization probe as well as any
-    ///   subsequent read or seek operations.
+    /// * `handle` - An opaque cancellation handle ([`HttpCancelHandle`]) or reference to it.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// * The operation is canceled via the provided `cancel_token` (returns
-    ///   [`HttpError::Cancelled`]).
+    /// * The operation is canceled via the provided `handle` (returns [`HttpError::Cancelled`]).
     /// * The remote server does not support HTTP Range requests (fails to return HTTP 206).
     /// * The total stream length cannot be determined.
     /// * A transport or connection error occurs during the initial network probe.
-    pub fn new_with_token(url: &str, cancel_token: CancellationToken) -> Result<Self> {
+    pub fn new_with_cancel_handle(url: &str, handle: impl Into<HttpCancelHandle>) -> Result<Self> {
+        let handle = handle.into();
         let rt = Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -150,11 +205,12 @@ impl HttpAudioSource {
             .build()
             .map_err(|e| HttpError::Transport(e.to_string()))?;
 
+        let active_token = handle.token();
         let (content_length, body_reader) = rt.block_on(async {
             tokio::select! {
                 res = Self::probe_stream(&client, url) => res,
 
-                () = cancel_token.cancelled() => {
+                () = active_token.cancelled() => {
                     Err(HttpError::Cancelled.into())
                 }
             }
@@ -166,9 +222,22 @@ impl HttpAudioSource {
             content_length,
             current_pos: 0,
             body_reader: Some(body_reader),
-            cancel_token,
+            cancel_handle: handle,
+            active_token,
             rt,
         })
+    }
+
+    fn refresh_active_token(&mut self) -> CancellationToken {
+        self.active_token = self.cancel_handle.token();
+        self.active_token.clone()
+    }
+
+    fn cancel_token(&mut self) -> CancellationToken {
+        if self.active_token.is_cancelled() {
+            self.refresh_active_token();
+        }
+        self.active_token.clone()
     }
 
     async fn probe_stream(client: &Client, url: &str) -> Result<(u64, AsyncReader)> {
@@ -275,7 +344,7 @@ impl HttpAudioSource {
             #[allow(unused_variables)]
             Err(e) => {
                 #[cfg(feature = "tracing")]
-                tracing::warn!("Transport error: {e}. Tagged for retry.");
+                tracing::warn!("Transport error during seek request: {e}. Tagged for retry.");
 
                 FetchAction::Retry(None)
             }
@@ -290,10 +359,11 @@ impl HttpAudioSource {
             return Ok(());
         }
 
-        let mut retry_policy = RetryPolicy::new(self.cancel_token.clone());
+        let cancel_token = self.cancel_token();
+        let mut retry_policy = RetryPolicy::new(cancel_token.clone());
 
         loop {
-            if self.cancel_token.is_cancelled() {
+            if cancel_token.is_cancelled() {
                 return Err(HttpError::Cancelled.into());
             }
 
@@ -362,22 +432,24 @@ impl RetryPolicy {
 
 impl Read for HttpAudioSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.current_pos >= self.content_length {
+        if self.current_pos >= self.content_length || buf.is_empty() {
             return Ok(0);
         }
 
         let mut network_retried = false;
 
         loop {
+            let cancel_token = self.cancel_token();
+            let rt_handle = self.rt.handle().clone();
+
             if self.body_reader.is_none() {
-                let rt_handle = self.rt.handle().clone();
-                let cancel_token = self.cancel_token.clone();
                 let target_pos = self.current_pos;
+                let token = cancel_token.clone();
 
                 rt_handle.block_on(async {
                     tokio::select! {
                         res = self.hard_seek_with_retry(target_pos) => res.map_err(io::Error::from),
-                        () = cancel_token.cancelled() => Err(Error::new(ErrorKind::Interrupted, "Cancelled")),
+                        () = token.cancelled() => Err(Error::new(ErrorKind::Interrupted, "Cancelled")),
                     }
                 })?;
 
@@ -386,8 +458,6 @@ impl Read for HttpAudioSource {
                 }
             }
 
-            let rt_handle = self.rt.handle().clone();
-            let cancel_token = self.cancel_token.clone();
             let reader = self.body_reader.as_mut().unwrap();
 
             let read_result = rt_handle.block_on(async {
@@ -452,6 +522,16 @@ impl Read for HttpAudioSource {
 }
 
 impl Seek for HttpAudioSource {
+    /// Seeks to an offset in bytes.
+    ///
+    /// Note on Seek Strategy:
+    ///
+    /// Implementing a lazy seek (deferring HTTP Range requests until the next `read()`)
+    /// might improve performance.
+    ///
+    /// However, to strictly match FFmpeg's internal protocol behavior (where `http_seek`
+    /// immediately attempts reconnection and returns exact I/O results to the demuxer), we
+    /// perform a synchronous, immediate seek here.
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let target_pos = match pos {
             SeekFrom::Start(offset) => offset,
@@ -524,7 +604,7 @@ impl Seek for HttpAudioSource {
         }
 
         let rt_handle = self.rt.handle().clone();
-        let cancel_token = self.cancel_token.clone();
+        let cancel_token = self.cancel_token();
 
         rt_handle.block_on(async {
             tokio::select! {
@@ -621,17 +701,18 @@ mod tests {
 
     #[test]
     fn test_instant_cancellation() {
-        let token = CancellationToken::new();
-        let token_clone = token.clone();
+        let cancel_handle = HttpCancelHandle::new();
+        let cancel_handle_clone = cancel_handle.clone();
 
-        let handle =
-            thread::spawn(move || HttpAudioSource::new_with_token(BLOCKHOLE_URL, token_clone));
+        let handle = thread::spawn(move || {
+            HttpAudioSource::new_with_cancel_handle(BLOCKHOLE_URL, cancel_handle_clone)
+        });
 
         thread::sleep(Duration::from_millis(100));
 
         let cancel_start_time = Instant::now();
 
-        token.cancel();
+        cancel_handle.cancel();
 
         let result = handle.join().unwrap();
 
@@ -676,6 +757,50 @@ mod tests {
         assert!(
             elapsed >= Duration::from_secs(2),
             "Should have retried twice and waited at least 2 seconds, elapsed: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn test_read_zero_buffer() {
+        let cancel_handle = HttpCancelHandle::new();
+        let mut source = HttpAudioSource {
+            url: "http://localhost/dummy.mp3".to_string(),
+            client: Client::new(),
+            content_length: 1024,
+            current_pos: 0,
+            body_reader: None,
+            cancel_handle: cancel_handle.clone(),
+            active_token: cancel_handle.token(),
+            rt: tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap(),
+        };
+
+        let mut empty_buf = [0u8; 0];
+        let res = source.read(&mut empty_buf);
+
+        assert!(res.is_ok(), "read(0) must return Ok(0)");
+        assert_eq!(res.unwrap(), 0);
+        assert_eq!(source.current_pos, 0, "read(0) must not modify current_pos");
+        assert!(
+            source.body_reader.is_none(),
+            "read(0) must not initialize or reset body_reader"
+        );
+    }
+
+    #[test]
+    fn test_shared_token_cancellation_and_reset() {
+        let cancel_handle = HttpCancelHandle::new();
+
+        assert!(!cancel_handle.is_cancelled());
+
+        cancel_handle.cancel();
+        assert!(cancel_handle.is_cancelled());
+
+        cancel_handle.reset();
+        assert!(
+            !cancel_handle.is_cancelled(),
+            "Reset token should restore uncancelled state"
         );
     }
 }

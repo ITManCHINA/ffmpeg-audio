@@ -5,7 +5,10 @@ pub mod log;
 pub mod resample;
 
 #[cfg(feature = "http")]
-pub use core::http::HttpAudioSource;
+pub use core::http::{
+    HttpAudioSource,
+    HttpCancelHandle,
+};
 pub use core::{
     format::AudioSample,
     frame::{

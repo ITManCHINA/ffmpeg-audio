@@ -32,7 +32,9 @@ fn http_test() {
     println!("Duration: {duration:?}");
 
     println!("Seeking to 10s...");
-    reader.seek(Duration::from_secs(10)).unwrap();
+    reader
+        .seek(Duration::from_secs(10), ffmpeg_audio::SeekMode::Accurate)
+        .unwrap();
 
     println!("Reading some frames...");
     for _ in 0..5 {
