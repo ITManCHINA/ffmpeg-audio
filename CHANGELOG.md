@@ -6,6 +6,15 @@ All notable changes to `ffmpeg_audio` and `ffmpeg_audio_sys` will be documented 
 
 <!-- Changes not yet released go here -->
 
+## [0.3.1] - 2026-08-05
+
+### ffmpeg_audio
+
+#### Refactored
+
+- **Refactored** HTTP reconnection handling to automatically reconnect when the server closes the connection unexpectedly, using bounded exponential backoff.
+- **Refactored** HTTP range request validation to verify the `Content-Range` start offset and total length for the initial request and subsequent seeks or reconnects.
+
 ---
 
 ## [0.3.0] - 2026-08-05
@@ -99,7 +108,8 @@ All notable changes to `ffmpeg_audio` and `ffmpeg_audio_sys` will be documented 
 
 - Initial release of raw FFmpeg FFI bindings.
 
-[unreleased]: https://github.com/apoint123/ffmpeg-audio/compare/v0.3.0...HEAD
+[unreleased]: https://github.com/apoint123/ffmpeg-audio/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/apoint123/ffmpeg-audio/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/apoint123/ffmpeg-audio/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/apoint123/ffmpeg-audio/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/apoint123/ffmpeg-audio/compare/v0.1.1...v0.1.2
