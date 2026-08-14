@@ -97,6 +97,9 @@ class FFmpegAudioProcessor extends AudioWorkletProcessor {
 				this.currentRate = data.payload.rate;
 			} else if (data.type === "SET_ALGORITHM" && this.stProcessor) {
 				const algoEnum = parseStretchAlgorithm(data.payload.algorithm);
+				if (this.audioReader) {
+					this.audioReader.rewindReadIndexToPlayback();
+				}
 				this.stProcessor.setAlgorithm(algoEnum);
 				this.inputChunkSize = this.stProcessor.getInputChunkSize();
 				this.playbackFractional = 0.0;
